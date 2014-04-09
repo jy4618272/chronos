@@ -15,7 +15,7 @@ import org.joda.time.format.DateTimeFormat
 import com.google.common.util.concurrent.AbstractIdleService
 import akka.actor.ActorRef
 import org.apache.curator.framework.CuratorFramework
-import org.apache.curator.framework.recipes.leader.LeaderLatch
+import org.apache.curator.framework.recipes.leader.{LeaderLatchListener, Participant, LeaderLatch}
 import org.apache.curator.framework.api.CuratorWatcher
 import org.apache.zookeeper.WatchedEvent
 
@@ -46,6 +46,7 @@ class JobScheduler @Inject()(val scheduleHorizon: Period,
 
   val localExecutor = Executors.newFixedThreadPool(1)
   val schedulerThreadFuture = new AtomicReference[Future[_]]
+  val leaderExecutor = Executors.newSingleThreadExecutor()
 
   //TODO(FL): Take some methods out of this class.
 
@@ -584,8 +585,18 @@ class JobScheduler @Inject()(val scheduleHorizon: Period,
     assert(!running.get, "This scheduler is already running!")
     log.info("Trying to become leader.")
 
+    leaderLatch.addListener(new LeaderLatchListener {
+      override def notLeader(): Unit = {
+        leader.set(false)
+        onDefeated()
+      }
+
+      override def isLeader(): Unit = {
+        leader.set(true)
+        onElected()
+      }
+    }, leaderExecutor)
     leaderLatch.start()
-    watchElection()
   }
 
   override def shutDown() {
@@ -593,28 +604,10 @@ class JobScheduler @Inject()(val scheduleHorizon: Period,
     log.info("Shutting down job scheduler")
 
     leaderLatch.close(LeaderLatch.CloseMode.NOTIFY_LEADER)
+    leaderExecutor.shutdown()
   }
 
   //End Service interface
-
-  def watchElection() {
-    curator.getChildren.usingWatcher(new CuratorWatcher {
-      override def process(event: WatchedEvent) {
-        val wasLeader: Boolean = leader.get()
-        val isLeader: Boolean = leaderLatch.hasLeadership
-
-        leader.set(isLeader)
-
-        if (wasLeader && !isLeader) {
-          // Voted down
-          onDefeated()
-        } else if (!wasLeader && isLeader) {
-          // Voted up
-          onElected()
-        }
-      }
-    }).inBackground().forPath(leaderPath)
-  }
 
   //Begin Leader interface, which is required for CandidateImpl.
   def onDefeated() {
@@ -623,8 +616,6 @@ class JobScheduler @Inject()(val scheduleHorizon: Period,
     log.info("Defeated. Not the current leader.")
     running.set(false)
     schedulerThreadFuture.get.cancel(true)
-
-    System.exit(1)
   }
 
   def onElected() {
@@ -656,7 +647,7 @@ class JobScheduler @Inject()(val scheduleHorizon: Period,
 
     schedulerThreadFuture.set(f)
     log.info("Starting mesos driver")
-    mesosDriver.get().start()
+    mesosDriver.start()
   }
 
   //End Leader interface
